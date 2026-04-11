@@ -17,7 +17,9 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_http_client.h"
 #include "app_sr.h"
+#include "ui_sr.h"
 
 #include "esp_mn_speech_commands.h"
 #include "esp_process_sdkconfig.h"
@@ -207,63 +209,181 @@ static void audio_detect_task(void *arg)
         }
 
         if (true == detect_flag) {
-            /* Save audio data to file if record enabled */
-            if (g_sr_data->b_record_en && (NULL != g_sr_data->fp)) {
-                fwrite(res->data, 1, afe_chunksize * sizeof(int16_t), g_sr_data->fp);
-            }
+            /*
+             * Obi-Wan bridge mode: buffer audio after wake word,
+             * then POST to bridge for STT → Claude → TTS pipeline.
+             * Replaces MultiNet offline command recognition.
+             */
+            #define BRIDGE_URL "http://192.168.88.9:9090/talk"
+            #define RECORD_SECONDS 5
+            #define MAX_RECORD_SAMPLES (16000 * RECORD_SECONDS)
 
-            esp_mn_state_t mn_state = ESP_MN_STATE_DETECTING;
-            if (false == sr_echo_is_playing()) {
-                mn_state = g_sr_data->multinet->detect(g_sr_data->model_data, res->data);
-            } else {
-                continue;
-            }
-
-            if (ESP_MN_STATE_DETECTING == mn_state) {
-                continue;
-            }
-
-            if (ESP_MN_STATE_TIMEOUT == mn_state) {
-                ESP_LOGW(TAG, "Time out");
-                sr_result_t result = {
-                    .wakenet_mode = WAKENET_NO_DETECT,
-                    .state = mn_state,
-                    .command_id = 0,
-                };
-                xQueueSend(g_sr_data->result_que, &result, 0);
+            /* Allocate recording buffer in PSRAM */
+            int16_t *rec_buf = (int16_t *)heap_caps_malloc(MAX_RECORD_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+            if (!rec_buf) {
+                ESP_LOGE(TAG, "Failed to allocate recording buffer");
                 g_sr_data->afe_handle->enable_wakenet(afe_data);
                 detect_flag = false;
                 continue;
             }
 
-            if (ESP_MN_STATE_DETECTED == mn_state) {
-                esp_mn_results_t *mn_result = g_sr_data->multinet->get_results(g_sr_data->model_data);
-                for (int i = 0; i < mn_result->num; i++) {
-                    printf("TOP %d, command_id: %d, phrase_id: %d, prob: %f\n",
-                           i + 1, mn_result->command_id[i], mn_result->phrase_id[i], mn_result->prob[i]);
-                }
+            size_t total_samples = 0;
 
-                int sr_command_id = mn_result->command_id[0];
-                ESP_LOGI(TAG, "Detected command : %d", sr_command_id);
-                sr_result_t result = {
-                    .wakenet_mode = WAKENET_NO_DETECT,
-                    .state = mn_state,
-                    .command_id = sr_command_id,
-                };
-                xQueueSend(g_sr_data->result_que, &result, 0);
-#if !SR_CONTINUE_DET
-                g_sr_data->afe_handle->enable_wakenet(afe_data);
-                detect_flag = false;
-#endif
+            ESP_LOGI(TAG, "Recording %d seconds for bridge...", RECORD_SECONDS);
 
-                if (g_sr_data->b_record_en && (NULL != g_sr_data->fp)) {
-                    ESP_LOGI(TAG, "File saved");
-                    fclose(g_sr_data->fp);
-                    g_sr_data->fp = NULL;
+            /* Record fixed duration */
+            while (total_samples < MAX_RECORD_SAMPLES) {
+                afe_fetch_result_t *r = afe_handle->fetch(afe_data);
+                if (!r || r->ret_value == ESP_FAIL) continue;
+
+                size_t samples_to_copy = afe_chunksize;
+                if (total_samples + samples_to_copy > MAX_RECORD_SAMPLES) {
+                    samples_to_copy = MAX_RECORD_SAMPLES - total_samples;
                 }
-                continue;
+                memcpy(&rec_buf[total_samples], r->data, samples_to_copy * sizeof(int16_t));
+                total_samples += samples_to_copy;
             }
-            ESP_LOGE(TAG, "Exception unhandled");
+
+            ESP_LOGI(TAG, "Recorded %zu samples (%.1f sec)", total_samples, (float)total_samples / 16000);
+
+            /* POST audio to bridge */
+            if (total_samples > 0) {
+                ESP_LOGI(TAG, "Sending to bridge...");
+
+                esp_http_client_config_t config = {
+                    .url = BRIDGE_URL,
+                    .timeout_ms = 90000,
+                };
+                esp_http_client_handle_t client = esp_http_client_init(&config);
+                esp_http_client_set_method(client, HTTP_METHOD_POST);
+                esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+
+                esp_err_t err = esp_http_client_open(client, total_samples * sizeof(int16_t));
+                if (err == ESP_OK) {
+                    esp_http_client_write(client, (const char *)rec_buf, total_samples * sizeof(int16_t));
+                    int content_length = esp_http_client_fetch_headers(client);
+                    int status = esp_http_client_get_status_code(client);
+                    ESP_LOGI(TAG, "Bridge response: status=%d, length=%d", status, content_length);
+
+                    ESP_LOGI(TAG, "Bridge responded, status=%d len=%d", status, content_length);
+                    if (status == 200 && content_length > 44) {
+                        /* Read WAV response */
+                        uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM);
+                        if (wav_buf) {
+                            int read_len = esp_http_client_read(client, (char *)wav_buf, content_length);
+                            ESP_LOGI(TAG, "Read %d bytes of audio response", read_len);
+
+                            if (read_len > 44) {
+                                /* Walk RIFF chunks to find fmt + data — the voice server
+                                 * emits a LIST/INFO chunk between fmt and data, so the
+                                 * hardcoded 44-byte header skip used by sr_echo_play is
+                                 * wrong for our input. The voice server also returns mono,
+                                 * while the built-in echoes are stereo; duplicate each
+                                 * 16-bit sample to L=R so playback rate is correct. */
+                                uint16_t channels = 0;
+                                uint32_t sample_rate = 0;
+                                uint16_t bits_per_sample = 0;
+                                uint8_t *pcm = NULL;
+                                int pcm_len = 0;
+
+                                if (read_len >= 12 &&
+                                    memcmp(wav_buf, "RIFF", 4) == 0 &&
+                                    memcmp(wav_buf + 8, "WAVE", 4) == 0) {
+
+                                    int off = 12;
+                                    while (off + 8 <= read_len) {
+                                        uint32_t chunk_size;
+                                        memcpy(&chunk_size, wav_buf + off + 4, 4);
+                                        int body = off + 8;
+
+                                        if (memcmp(wav_buf + off, "fmt ", 4) == 0 && chunk_size >= 16) {
+                                            memcpy(&channels,        wav_buf + body + 2,  2);
+                                            memcpy(&sample_rate,     wav_buf + body + 4,  4);
+                                            memcpy(&bits_per_sample, wav_buf + body + 14, 2);
+                                        } else if (memcmp(wav_buf + off, "data", 4) == 0) {
+                                            pcm = wav_buf + body;
+                                            pcm_len = (int)chunk_size;
+                                            if (body + pcm_len > read_len) {
+                                                pcm_len = read_len - body;
+                                            }
+                                            break;
+                                        }
+                                        off = body + (int)chunk_size + ((int)chunk_size & 1);
+                                    }
+                                }
+
+                                if (pcm && pcm_len > 0 && bits_per_sample == 16 && sample_rate > 0 && channels > 0) {
+                                    ESP_LOGI(TAG, "WAV fmt: %u ch, %u Hz, %u-bit, %d bytes PCM",
+                                             channels, (unsigned)sample_rate, bits_per_sample, pcm_len);
+
+                                    uint8_t *play_buf = pcm;
+                                    int play_len = pcm_len & ~0x3;
+                                    bool allocated_play_buf = false;
+
+                                    if (channels == 1) {
+                                        int sample_count = pcm_len / 2;
+                                        play_len = sample_count * 4;
+                                        play_buf = (uint8_t *)heap_caps_malloc(play_len, MALLOC_CAP_SPIRAM);
+                                        if (!play_buf) {
+                                            ESP_LOGE(TAG, "Failed to allocate stereo playback buffer (%d bytes)", play_len);
+                                            play_len = 0;
+                                        } else {
+                                            allocated_play_buf = true;
+                                            const int16_t *mono = (const int16_t *)pcm;
+                                            int16_t *stereo = (int16_t *)play_buf;
+                                            for (int i = 0; i < sample_count; i++) {
+                                                stereo[i * 2]     = mono[i];
+                                                stereo[i * 2 + 1] = mono[i];
+                                            }
+                                        }
+                                    }
+
+                                    if (play_len > 0) {
+                                        bsp_codec_set_fs(sample_rate, bits_per_sample, I2S_SLOT_MODE_STEREO);
+                                        bsp_codec_mute_set(true);
+                                        bsp_codec_mute_set(false);
+                                        bsp_codec_volume_set(100, NULL);
+                                        vTaskDelay(pdMS_TO_TICKS(50));
+
+                                        size_t bytes_written = 0;
+                                        bsp_i2s_write((char *)play_buf, play_len, &bytes_written, portMAX_DELAY);
+                                        vTaskDelay(pdMS_TO_TICKS(20));
+
+                                        sys_param_t *param = settings_get_parameter();
+                                        bsp_codec_volume_set(param->volume, NULL);
+                                    }
+
+                                    if (allocated_play_buf) {
+                                        heap_caps_free(play_buf);
+                                    }
+                                } else {
+                                    ESP_LOGE(TAG, "Invalid WAV: ch=%u rate=%u bits=%u pcm=%d",
+                                             channels, (unsigned)sample_rate, bits_per_sample, pcm_len);
+                                }
+                            }
+                            heap_caps_free(wav_buf);
+                        } else {
+                            ESP_LOGE(TAG, "Failed to allocate WAV buffer (%d bytes)", content_length);
+                        }
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Bridge connection failed: %s", esp_err_to_name(err));
+                }
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+            }
+
+            heap_caps_free(rec_buf);
+
+            /* Signal end and re-enable wake word detection */
+            sr_result_t result = {
+                .wakenet_mode = WAKENET_NO_DETECT,
+                .state = ESP_MN_STATE_TIMEOUT,
+                .command_id = 0,
+            };
+            xQueueSend(g_sr_data->result_que, &result, 0);
+            g_sr_data->afe_handle->enable_wakenet(afe_data);
+            detect_flag = false;
         }
     }
     /* Task never returns */
