@@ -162,20 +162,21 @@ void sr_handler_task(void *pvParam)
         sr_current_lang = sr_detect_language();
 
         if (ESP_MN_STATE_TIMEOUT == result.state) {
-            if (SR_LANG_EN == sr_current_lang) {
-                sr_anim_set_text("Timeout");
-            } else {
-                sr_anim_set_text("超时");
-            }
-            if (AUDIO_PLAYER_STATE_PLAYING == last_player_state) {
-                audio_player_pause();
-            }
-#if !SR_RUN_TEST
-            sr_echo_play(AUDIO_END);
-#endif
+            /* Quietly return to idle — no "Timeout" text, no end chime */
             sr_anim_stop();
             if (AUDIO_PLAYER_STATE_PLAYING == last_player_state) {
                 audio_player_resume();
+            }
+            continue;
+        }
+
+        /* Obi-Wan bridge: command_id == -1 with DETECTING is the
+         * "utterance captured, processing now" signal from app_sr.c. */
+        if (ESP_MN_STATE_DETECTING == result.state && result.command_id == -1) {
+            if (SR_LANG_EN == sr_current_lang) {
+                sr_anim_set_text("Processing");
+            } else {
+                sr_anim_set_text("处理中");
             }
             continue;
         }

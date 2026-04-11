@@ -215,8 +215,11 @@ static void audio_detect_task(void *arg)
              * Replaces MultiNet offline command recognition.
              */
             #define BRIDGE_URL "http://192.168.88.9:9090/talk"
-            #define RECORD_SECONDS 5
-            #define MAX_RECORD_SAMPLES (16000 * RECORD_SECONDS)
+            #define SR_SAMPLE_RATE 16000
+            #define MAX_RECORD_SECONDS 20
+            #define MAX_RECORD_SAMPLES (SR_SAMPLE_RATE * MAX_RECORD_SECONDS)
+            #define SILENCE_STOP_SAMPLES (SR_SAMPLE_RATE * 1)        /* 1.0s of silence ends the utterance */
+            #define NO_SPEECH_TIMEOUT_SAMPLES (SR_SAMPLE_RATE * 3)   /* 3.0s with no speech → abort */
 
             /* Allocate recording buffer in PSRAM */
             int16_t *rec_buf = (int16_t *)heap_caps_malloc(MAX_RECORD_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -228,10 +231,12 @@ static void audio_detect_task(void *arg)
             }
 
             size_t total_samples = 0;
+            size_t silence_samples = 0;
+            bool speech_seen = false;
 
-            ESP_LOGI(TAG, "Recording %d seconds for bridge...", RECORD_SECONDS);
+            ESP_LOGI(TAG, "Recording (VAD: stop on 1.0s silence, max %ds)...", MAX_RECORD_SECONDS);
 
-            /* Record fixed duration */
+            /* Record until VAD detects sustained silence, no-speech timeout, or max cap */
             while (total_samples < MAX_RECORD_SAMPLES) {
                 afe_fetch_result_t *r = afe_handle->fetch(afe_data);
                 if (!r || r->ret_value == ESP_FAIL) continue;
@@ -242,12 +247,43 @@ static void audio_detect_task(void *arg)
                 }
                 memcpy(&rec_buf[total_samples], r->data, samples_to_copy * sizeof(int16_t));
                 total_samples += samples_to_copy;
+
+                if (r->vad_state == AFE_VAD_SPEECH) {
+                    silence_samples = 0;
+                    if (!speech_seen) {
+                        speech_seen = true;
+                        ESP_LOGI(TAG, "Speech detected");
+                    }
+                } else {
+                    silence_samples += samples_to_copy;
+                }
+
+                if (speech_seen && silence_samples >= SILENCE_STOP_SAMPLES) {
+                    ESP_LOGI(TAG, "End of utterance (silence)");
+                    break;
+                }
+                if (!speech_seen && total_samples >= NO_SPEECH_TIMEOUT_SAMPLES) {
+                    ESP_LOGW(TAG, "No speech heard, aborting");
+                    break;
+                }
             }
 
-            ESP_LOGI(TAG, "Recorded %zu samples (%.1f sec)", total_samples, (float)total_samples / 16000);
+            ESP_LOGI(TAG, "Recorded %zu samples (%.2f sec), speech_seen=%d",
+                     total_samples, (float)total_samples / SR_SAMPLE_RATE, (int)speech_seen);
 
-            /* POST audio to bridge */
-            if (total_samples > 0) {
+            /* POST audio to bridge only if we actually heard speech */
+            if (speech_seen && total_samples > 0) {
+                /* Signal sr_handler to swap the UI to "Processing" while
+                 * we wait on STT → LLM → TTS. command_id=-1 is the
+                 * sentinel that distinguishes this from a real MultiNet
+                 * detecting tick. */
+                sr_result_t processing_msg = {
+                    .wakenet_mode = WAKENET_NO_DETECT,
+                    .state = ESP_MN_STATE_DETECTING,
+                    .command_id = -1,
+                };
+                xQueueSend(g_sr_data->result_que, &processing_msg, 0);
+
                 ESP_LOGI(TAG, "Sending to bridge...");
 
                 esp_http_client_config_t config = {
