@@ -31,6 +31,7 @@
 static const char *TAG = "ui_main";
 
 LV_FONT_DECLARE(font_icon_16);
+LV_IMG_DECLARE(img_obiwan);
 
 static int g_item_index = 0;
 static lv_group_t *g_btn_op_group = NULL;
@@ -506,7 +507,14 @@ static void ui_after_boot(void)
         /* Show default hint page */
         ui_help(NULL);
     } else {
-        ui_main_menu(g_item_index);
+        /* Obi-Wan home screen: hide the factory chooser and show the
+         * 320x240 portrait full-screen. The sr_anim overlay ("Say
+         * command" / "Processing") draws on top of this when the
+         * wake word fires. */
+        ui_status_bar_set_visible(false);
+        lv_obj_t *obiwan_img = lv_img_create(lv_scr_act());
+        lv_img_set_src(obiwan_img, &img_obiwan);
+        lv_obj_align(obiwan_img, LV_ALIGN_CENTER, 0, 0);
     }
 }
 
