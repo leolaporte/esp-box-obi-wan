@@ -2,6 +2,8 @@
 
 This is a fork of Espressif's [esp-box](https://github.com/espressif/esp-box) modified to turn the ESP32-S3-BOX-3 into a voice client for [obi-wan-core](https://github.com/leolaporte/obi-wan-core) — Leo's unified Obi-Wan backend.
 
+**Hardware:** this firmware is written specifically for the [Espressif ESP32-S3-BOX-3 Development Board](https://www.amazon.com/dp/B0CL6HD8JX) (touch LCD + microphone array + speaker in one handheld enclosure). Other ESP-BOX variants are not currently supported.
+
 **What's changed:** `examples/factory_demo` has been retrofitted. "Hi ESP" wake word triggers a voice-activated recording with VAD end-of-utterance detection; the captured PCM is POSTed to obi-wan-core on the LAN; the Piper TTS reply plays back through the BOX speaker; the home screen shows an Obi-Wan portrait and a "Listening" overlay on wake.
 
 - **Firmware entrypoints:** `examples/factory_demo/main/app/app_sr.c` (wake + VAD + HTTP), `app/app_sr_handler.c` (UI state), `gui/ui_main.c` (home screen), `gui/ui_sr.c` (overlay mask), `gui/image/img_obiwan.c` (portrait asset).
