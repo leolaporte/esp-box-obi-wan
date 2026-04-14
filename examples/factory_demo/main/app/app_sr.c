@@ -218,7 +218,7 @@ static void audio_detect_task(void *arg)
             #define SR_SAMPLE_RATE 16000
             #define MAX_RECORD_SECONDS 60
             #define MAX_RECORD_SAMPLES (SR_SAMPLE_RATE * MAX_RECORD_SECONDS)
-            #define SILENCE_STOP_MS 1800                             /* 1.8s of silence ends the utterance */
+            #define SILENCE_STOP_MS 2500                             /* 2.5s of silence ends the utterance */
             #define SILENCE_STOP_SAMPLES (SR_SAMPLE_RATE * SILENCE_STOP_MS / 1000)
             #define MIN_SPEECH_MS 500                                /* need this much cumulative speech before silence stop arms */
             #define MIN_SPEECH_SAMPLES (SR_SAMPLE_RATE * MIN_SPEECH_MS / 1000)
