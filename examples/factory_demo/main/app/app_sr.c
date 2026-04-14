@@ -216,10 +216,13 @@ static void audio_detect_task(void *arg)
              */
             #define BRIDGE_URL "http://192.168.88.9:9090/talk"
             #define SR_SAMPLE_RATE 16000
-            #define MAX_RECORD_SECONDS 20
+            #define MAX_RECORD_SECONDS 60
             #define MAX_RECORD_SAMPLES (SR_SAMPLE_RATE * MAX_RECORD_SECONDS)
-            #define SILENCE_STOP_SAMPLES (SR_SAMPLE_RATE * 1)        /* 1.0s of silence ends the utterance */
-            #define NO_SPEECH_TIMEOUT_SAMPLES (SR_SAMPLE_RATE * 3)   /* 3.0s with no speech → abort */
+            #define SILENCE_STOP_MS 1800                             /* 1.8s of silence ends the utterance */
+            #define SILENCE_STOP_SAMPLES (SR_SAMPLE_RATE * SILENCE_STOP_MS / 1000)
+            #define MIN_SPEECH_MS 500                                /* need this much cumulative speech before silence stop arms */
+            #define MIN_SPEECH_SAMPLES (SR_SAMPLE_RATE * MIN_SPEECH_MS / 1000)
+            #define NO_SPEECH_TIMEOUT_SAMPLES (SR_SAMPLE_RATE * 4)   /* 4.0s with no speech → abort */
 
             /* Allocate recording buffer in PSRAM */
             int16_t *rec_buf = (int16_t *)heap_caps_malloc(MAX_RECORD_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -232,9 +235,11 @@ static void audio_detect_task(void *arg)
 
             size_t total_samples = 0;
             size_t silence_samples = 0;
+            size_t speech_samples = 0;
             bool speech_seen = false;
 
-            ESP_LOGI(TAG, "Recording (VAD: stop on 1.0s silence, max %ds)...", MAX_RECORD_SECONDS);
+            ESP_LOGI(TAG, "Recording (VAD: need %dms speech, stop on %dms silence, max %ds)...",
+                     MIN_SPEECH_MS, SILENCE_STOP_MS, MAX_RECORD_SECONDS);
 
             /* Record until VAD detects sustained silence, no-speech timeout, or max cap */
             while (total_samples < MAX_RECORD_SAMPLES) {
@@ -250,9 +255,11 @@ static void audio_detect_task(void *arg)
 
                 if (r->vad_state == AFE_VAD_SPEECH) {
                     silence_samples = 0;
-                    if (!speech_seen) {
+                    speech_samples += samples_to_copy;
+                    if (!speech_seen && speech_samples >= MIN_SPEECH_SAMPLES) {
                         speech_seen = true;
-                        ESP_LOGI(TAG, "Speech detected");
+                        ESP_LOGI(TAG, "Speech armed (%ums cumulative)",
+                                 (unsigned)(speech_samples * 1000 / SR_SAMPLE_RATE));
                     }
                 } else {
                     silence_samples += samples_to_copy;
@@ -273,22 +280,28 @@ static void audio_detect_task(void *arg)
 
             /* POST audio to bridge only if we actually heard speech */
             if (speech_seen && total_samples > 0) {
-                /* Signal sr_handler to swap the UI to "Processing" while
-                 * we wait on STT → LLM → TTS. command_id=-1 is the
-                 * sentinel that distinguishes this from a real MultiNet
-                 * detecting tick. */
-                sr_result_t processing_msg = {
+                /* Hide the overlay immediately on end-of-utterance so
+                 * the idle portrait returns — no "Processing" state. */
+                sr_result_t hide_msg = {
                     .wakenet_mode = WAKENET_NO_DETECT,
-                    .state = ESP_MN_STATE_DETECTING,
-                    .command_id = -1,
+                    .state = ESP_MN_STATE_TIMEOUT,
+                    .command_id = 0,
                 };
-                xQueueSend(g_sr_data->result_que, &processing_msg, 0);
+                xQueueSend(g_sr_data->result_que, &hide_msg, 0);
 
                 ESP_LOGI(TAG, "Sending to bridge...");
+
+                /* Quiet AFE during the HTTP round-trip so it doesn't
+                 * starve lwip/TCP and spam rb_out warnings while the
+                 * WAV body is being read. Re-enabled below after
+                 * playback (line ~422). */
+                g_sr_data->afe_handle->disable_wakenet(afe_data);
 
                 esp_http_client_config_t config = {
                     .url = BRIDGE_URL,
                     .timeout_ms = 90000,
+                    .buffer_size = 8192,
+                    .buffer_size_tx = 1024,
                 };
                 esp_http_client_handle_t client = esp_http_client_init(&config);
                 esp_http_client_set_method(client, HTTP_METHOD_POST);

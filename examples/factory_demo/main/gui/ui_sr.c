@@ -205,6 +205,16 @@ void sr_anim_start(void)
 void sr_anim_stop(void)
 {
     lv_event_send(g_sr_mask, LV_EVENT_VALUE_CHANGED, (void *) false);
+    /* Force-hide the mask immediately so the idle portrait reappears as
+     * soon as the reply finishes playing, even if the 500ms animation
+     * timer is stalled. */
+    ui_acquire();
+    lv_obj_add_flag(g_sr_mask, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *player_page = get_player_page();
+    if (player_page) {
+        lv_obj_add_flag(player_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    ui_release();
 }
 
 void sr_anim_set_text(char *text)

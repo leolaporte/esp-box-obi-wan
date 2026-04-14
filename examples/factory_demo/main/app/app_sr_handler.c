@@ -162,7 +162,9 @@ void sr_handler_task(void *pvParam)
         sr_current_lang = sr_detect_language();
 
         if (ESP_MN_STATE_TIMEOUT == result.state) {
-            /* Quietly return to idle — no "Timeout" text, no end chime */
+            /* Quietly return to idle — clear label first so "Processing"
+             * disappears even if the mask takes a tick or two to hide. */
+            sr_anim_set_text("");
             sr_anim_stop();
             if (AUDIO_PLAYER_STATE_PLAYING == last_player_state) {
                 audio_player_resume();
@@ -186,7 +188,7 @@ void sr_handler_task(void *pvParam)
             last_player_state = audio_player_get_state();
             audio_player_pause();
             if (SR_LANG_EN == sr_current_lang) {
-                sr_anim_set_text("Say command");
+                sr_anim_set_text("Listening");
             } else {
                 sr_anim_set_text("请说");
             }
